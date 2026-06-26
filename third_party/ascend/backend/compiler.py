@@ -74,15 +74,8 @@ def min_dot_size(target: GPUTarget):
 
 
 def _get_dump_paths(hash_key: str, src_path: str, dst_path: str) -> Tuple[str, str]:
-    """
-    If TRITON_DUMP_DIR is set, return paths under that directory.
-    Otherwise, return the original src_path and dst_path.
-    """
-    dump_dir_env = os.getenv("TRITON_DUMP_DIR")
-    if dump_dir_env:
-        dump_dir = os.path.join(dump_dir_env, _base32(hash_key))
-        return (os.path.join(dump_dir, os.path.basename(src_path)), os.path.join(dump_dir, os.path.basename(dst_path)))
-    return (src_path, dst_path)
+    dump_manager = get_dump_manager(hash_key)
+    return (dump_manager._make_path(os.path.basename(src_path)), dump_manager._make_path(os.path.basename(dst_path)))
 
 
 def make_ttir(mod, metadata, opt):
