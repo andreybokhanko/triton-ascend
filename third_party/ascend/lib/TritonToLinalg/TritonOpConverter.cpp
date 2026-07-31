@@ -58,33 +58,11 @@
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HFusion/IR/HFusion.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 
 namespace TTOpConverters {
 using namespace mlir;
 using namespace triton;
-
-static const llvm::SmallVector<llvm::StringRef> libdeviceOps = {
-    "__hmf_trunc_fp32",        "__hmf_nearbyint_fp32",
-    "__hmf_copysign_fp32",     "__hmf_log10_fp32",
-    "__hmf_asin_fp32",         "__hmf_acos_fp32",
-    "__hmf_atan2_fp32",        "__hmf_sinh_fp32",
-    "__hmf_cosh_fp32",         "__hmf_asinh_fp32",
-    "__hmf_acosh_fp32",        "__hmf_atanh_fp32",
-    "__hmf_expm1_fp32",        "__hmf_nextafter_fp32",
-    "__hmf_hypot_fp32",        "__hmf_cyl_bessel_i0_fp32",
-    "__hmf_erfinv_fp32",       "__hmf_lgamma_fp32",
-    "__hmf_signbit_fp32",      "__hmf_rint_fp32",
-    "__hmf_round_fp32",        "__hmf_tan_fp32",
-    "__hmf_atan_fp32",         "__hmf_tanh_fp32",
-    "__hmf_fast_divide_fp32",  "__hmf_div_rz_fp32",
-    "__hmf_fmod_fp32",         "__hmf_fast_exp_fp32",
-    "__hmf_erf_fp32",          "__hmf_ldexp_fp32",
-    "__hmf_pow_fp32",          "__hmf_ilogb_fp32",
-    "__hmf_isnan_fp32",        "__hmf_isinf_fp32",
-    "__hmf_finite_fp32",       "__hmf_log1p_fp32",
-    "__hmf_relu_fp32",         "__hmf_tgamma_fp32",
-    "__hmf_float_as_int_fp32", "__hmf_reciprocal_fp32",
-};
 
 /**
  * Retrieves a boolean environment variable.
@@ -1354,7 +1332,18 @@ ScanConverter::convertToTargetOp(triton::ScanOp op,
     auto memrefType = MemRefType::get(shape, elementType);
     Value inputMemRef =
         rewriter.create<bufferization::ToBufferOp>(loc, memrefType, scanInput);
-    Value outputMemRef = rewriter.create<memref::AllocOp>(loc, memrefType);
+
+    // Wrap scan logic in a scope with UB address space for the output buffer.
+    auto tensorResultType = RankedTensorType::get(shape, elementType);
+    auto scopeOp =
+        rewriter.create<scope::ScopeOp>(loc, TypeRange{tensorResultType});
+    scopeOp.getBodyRegion().emplaceBlock();
+    rewriter.setInsertionPointToEnd(&scopeOp.getBodyRegion().front());
+
+    auto ubMemRefType = MemRefType::get(
+        shape, elementType, nullptr,
+        rewriter.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::UB));
+    Value outputMemRef = rewriter.create<memref::AllocOp>(loc, ubMemRefType);
 
     auto processDimension = [&](ArrayRef<Value> baseIdxsArray) {
       auto startInd = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), 0);
@@ -1451,13 +1440,17 @@ ScanConverter::convertToTargetOp(triton::ScanOp op,
     createSimpleNestedLoops(rewriter, loc, outputMemRef, nonScanDims,
                             processDimension);
 
-    rewriter.setInsertionPointAfter(op);
-
     mlir::Type resultType = mlir::memref::getTensorTypeFromMemRefType(
         dyn_cast<mlir::MemRefType>(outputMemRef.getType()));
     Value outputTensor = rewriter.create<bufferization::ToTensorOp>(
         loc, resultType, outputMemRef, true);
-    rewriter.replaceOp(op, outputTensor);
+    rewriter.create<scope::ReturnOp>(loc, ValueRange{outputTensor});
+
+    scopeOp->setAttr(hivm::TCoreTypeAttr::name,
+                     hivm::TCoreTypeAttr::get(rewriter.getContext(),
+                                              hivm::TCoreType::VECTOR));
+
+    rewriter.replaceOp(op, scopeOp.getResult(0));
     return success();
   }
 }
@@ -1687,76 +1680,6 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
     return failure();
   }
   if (op.getSymbol().contains("__hmf_")) {
-    // libdevice -> hivm.hir.custom
-    bool is_libdevice = llvm::is_contained(libdeviceOps, op.getSymbol());
-    if (is_libdevice) {
-      SmallVector<Value> newOuts;
-      SmallVector<Type> originalOutputTypes;
-      for (auto newOut : op->getResults()) {
-        originalOutputTypes.push_back(newOut.getType());
-        auto tensorType = dyn_cast<RankedTensorType>(newOut.getType());
-        Type elemType = tensorType.getElementType();
-        if (elemType.isInteger(1)) {
-          elemType = rewriter.getI32Type();
-        }
-        auto src = rewriter.create<tensor::EmptyOp>(
-            op->getLoc(), tensorType.getShape(), elemType);
-        newOuts.push_back(src);
-      }
-      ValueRange inputs{op->getOperands()};
-      ValueRange outputs{newOuts};
-      ValueRange temp_buffers{};
-      TypeRange res_types{outputs};
-      std::string sym =
-          llvm::join(llvm::split(op.getSymbol().str(), "__hmf_"), "");
-      auto customRes = rewriter.create<hivm::CustomOp>(
-          op.getLoc(), res_types, sym, inputs, outputs, temp_buffers);
-      auto arg_attrs_array = mlir::ArrayAttr::get(customRes->getContext(), {});
-      auto pipeAttr =
-          hivm::PipeAttr::get(customRes->getContext(), hivm::PIPE::PIPE_V);
-      auto tcoreTypeAttr = hivm::TCoreTypeAttr::get(customRes->getContext(),
-                                                    hivm::TCoreType::VECTOR);
-      auto vfModeAttr =
-          hivm::VFModeAttr::get(customRes->getContext(), hivm::VFMode::SIMD);
-      customRes->setAttr("arg_attrs", arg_attrs_array);
-      customRes->setAttr("bitcode",
-                         mlir::StringAttr::get(customRes->getContext(), ""));
-      customRes->setAttr("hivm.pipe", pipeAttr);
-      customRes->setAttr("hivm.tcore_type", tcoreTypeAttr);
-      customRes->setAttr("hivm.vf_mode", vfModeAttr);
-      customRes->setAttr("symbol",
-                         mlir::StringAttr::get(customRes->getContext(), sym));
-      SmallVector<Value> finalResults;
-      for (auto [customResult, origType] :
-           llvm::zip(customRes.getResults(), originalOutputTypes)) {
-        auto origTensorType = dyn_cast<RankedTensorType>(origType);
-        Type targetElemType = rewriter.getI8Type();
-        Type targetTensorType =
-            RankedTensorType::get(origTensorType.getShape(), targetElemType);
-
-        if (origTensorType.getElementType().isInteger(1)) {
-          auto i32ElemType = rewriter.getI32Type();
-          auto denseZeroAttr = DenseElementsAttr::get(
-              RankedTensorType::get(origTensorType.getShape(), i32ElemType), 0);
-          auto zeroTensor =
-              rewriter.create<arith::ConstantOp>(loc, denseZeroAttr);
-          auto cmp = rewriter.create<arith::CmpIOp>(
-              loc, arith::CmpIPredicate::ne, customResult, zeroTensor);
-
-          finalResults.push_back(cmp);
-        } else {
-          finalResults.push_back(customResult);
-        }
-      }
-      rewriter.replaceOp(op, finalResults);
-      return success();
-    } else {
-      if (op.getSymbol().contains("fp32") || op.getSymbol().contains("i32")) {
-        llvm::report_fatal_error("unsupported libdevice op symbol: " +
-                                 op.getSymbol());
-      }
-    }
-    // 1. get or create the declaration of external elementwise function
     Type dstTy = op.getResult().getType();
     bool isDstScalar = !isa<RankedTensorType>(dstTy);
     Type dstElemTy =
@@ -1766,13 +1689,163 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
     for (auto src : op.getSrcs()) {
       if (!isa<RankedTensorType>(src.getType())) {
         src = rewriter.create<tensor::FromElementsOp>(
-            op.getLoc(), RankedTensorType::get({(int64_t)1}, src.getType()),
+            op.getLoc(), RankedTensorType::get({int64_t{1}}, src.getType()),
             src);
       }
       srcs.push_back(src);
       srcElemTys.push_back(
           cast<RankedTensorType>(src.getType()).getElementType());
     }
+
+    // extern libdevice ops -> hivm.hir.custom
+    static constexpr llvm::StringLiteral simtLibdeviceSuffixes[] = {
+        "_fp32", "_fp16", "_bf16", "_i32", "_i64", "_u32", "_u64"};
+    bool isSimtLibdeviceOp =
+        llvm::any_of(simtLibdeviceSuffixes, [&](llvm::StringRef suffix) {
+          return op.getSymbol().ends_with(suffix);
+        });
+    if (isSimtLibdeviceOp) {
+      auto originalTensorType = isDstScalar
+                                    ? RankedTensorType::get({1}, dstElemTy)
+                                    : cast<RankedTensorType>(dstTy);
+      auto originalShape = llvm::to_vector(originalTensorType.getShape());
+      bool needsExpand = originalTensorType.getRank() != 1;
+      bool isI1Result = dstElemTy.isInteger(1);
+
+      Type customElemType = dstElemTy;
+      if (isI1Result)
+        customElemType = rewriter.getI32Type();
+
+      // Flatten inputs to 1D
+      SmallVector<Value> collapsedInputs;
+
+      for (Value operand : srcs) {
+        RankedTensorType tensorTy = cast<RankedTensorType>(operand.getType());
+        if (tensorTy.getRank() <= 1) {
+          collapsedInputs.push_back(operand);
+          continue;
+        }
+
+        int64_t totalSize = 1;
+        for (int64_t dim : tensorTy.getShape()) {
+          if (ShapedType::isDynamic(dim)) {
+            totalSize = ShapedType::kDynamic;
+            break;
+          }
+          totalSize *= dim;
+        }
+
+        ReassociationIndices indices;
+        for (int i = 0; i < tensorTy.getRank(); ++i)
+          indices.push_back(i);
+
+        RankedTensorType collapse1DTy =
+            RankedTensorType::get({totalSize}, tensorTy.getElementType());
+        Value collapsedVal = rewriter.create<tensor::CollapseShapeOp>(
+            op.getLoc(), collapse1DTy, operand, indices);
+        collapsedInputs.push_back(collapsedVal);
+      }
+
+      int64_t outputSize = 1;
+      for (int64_t dim : originalTensorType.getShape()) {
+        if (ShapedType::isDynamic(dim)) {
+          outputSize = ShapedType::kDynamic;
+          break;
+        }
+        outputSize *= dim;
+      }
+      auto customOutputType =
+          RankedTensorType::get({outputSize}, customElemType);
+
+      SmallVector<Value> dynamicSizes;
+      if (ShapedType::isDynamic(outputSize)) {
+        for (Value collapsedInput : collapsedInputs) {
+          auto collapsedInputType =
+              dyn_cast<RankedTensorType>(collapsedInput.getType());
+          if (!collapsedInputType || collapsedInputType.getRank() != 1 ||
+              !collapsedInputType.isDynamicDim(0))
+            continue;
+
+          dynamicSizes.push_back(
+              rewriter.create<tensor::DimOp>(op.getLoc(), collapsedInput, 0));
+          break;
+        }
+
+        if (dynamicSizes.empty())
+          return rewriter.notifyMatchFailure(
+              op, "cannot determine the runtime size of a dynamic "
+                  "libdevice output");
+      }
+
+      auto outputMemRefType =
+          MemRefType::get(customOutputType.getShape(), customElemType);
+      Value outputMemRef = rewriter.create<memref::AllocOp>(
+          op.getLoc(), outputMemRefType, dynamicSizes);
+      Value outputTensor = rewriter.create<bufferization::ToTensorOp>(
+          op.getLoc(), customOutputType, outputMemRef, true, true);
+
+      ReassociationIndices outputReassociation;
+      if (needsExpand) {
+        for (int i = 0; i < originalTensorType.getRank(); ++i)
+          outputReassociation.push_back(i);
+      }
+
+      std::string sym =
+          llvm::join(llvm::split(op.getSymbol().str(), "__hmf_"), "");
+      auto customOp = rewriter.create<hivm::CustomOp>(
+          op.getLoc(), sym, ValueRange{collapsedInputs},
+          ValueRange{outputTensor});
+
+      auto argAttrsArray = mlir::ArrayAttr::get(customOp->getContext(), {});
+      auto pipeAttr =
+          hivm::PipeAttr::get(customOp->getContext(), hivm::PIPE::PIPE_V);
+      auto tcoreTypeAttr = hivm::TCoreTypeAttr::get(customOp->getContext(),
+                                                    hivm::TCoreType::VECTOR);
+      auto vfModeAttr =
+          hivm::VFModeAttr::get(customOp->getContext(), hivm::VFMode::SIMD);
+
+      customOp->setAttr("bitcode",
+                        mlir::StringAttr::get(customOp->getContext(), ""));
+      customOp->setAttr("hivm.pipe", pipeAttr);
+      customOp->setAttr("hivm.tcore_type", tcoreTypeAttr);
+      customOp->setAttr("hivm.vf_mode", vfModeAttr);
+      customOp->setAttr("symbol",
+                        mlir::StringAttr::get(customOp->getContext(), sym));
+      customOp->setAttr("arg_attrs", argAttrsArray);
+
+      // Restore the result's shape and element type
+      Value finalResult = customOp.getResults().front();
+      if (needsExpand) {
+        auto expandedType =
+            RankedTensorType::get(originalShape, customElemType);
+        finalResult = rewriter.create<tensor::ExpandShapeOp>(
+            op->getLoc(), expandedType, finalResult, outputReassociation);
+      }
+
+      if (isI1Result) {
+        auto resultTensorType = cast<RankedTensorType>(finalResult.getType());
+        auto zeroAttr = DenseElementsAttr::get(
+            RankedTensorType::get(resultTensorType.getShape(),
+                                  rewriter.getI32Type()),
+            0);
+        Value zeroTensor =
+            rewriter.create<arith::ConstantOp>(op->getLoc(), zeroAttr);
+        finalResult = rewriter.create<arith::CmpIOp>(
+            op->getLoc(), arith::CmpIPredicate::ne, finalResult, zeroTensor);
+      }
+
+      if (isDstScalar) {
+        Value zero = rewriter.create<arith::ConstantOp>(
+            op->getLoc(), rewriter.getIndexAttr(0));
+        finalResult =
+            rewriter.create<tensor::ExtractOp>(op->getLoc(), finalResult, zero);
+      }
+
+      rewriter.replaceOp(op, finalResult);
+      return success();
+    }
+
+    // 1. get or create the declaration of external elementwise function
     FunctionType elemFuncType =
         FunctionType::get(rewriter.getContext(), srcElemTys, {dstElemTy});
     auto mod = SymbolTable::getNearestSymbolTable(op);
@@ -2131,20 +2204,7 @@ MatmulConverter::matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
   auto dstType = cast<RankedTensorType>(op.getType());
   auto elemTy = dstType.getElementType();
   auto inputPrec = op.getInputPrecision();
-  // Ascend does not support tf32;  map it to hf32 which provides similar
-  // functionality.HF32 is only valid for fp32 x fp32 inputs; for other
-  // dtypes, fall back to ieee.
-  if (inputPrec == InputPrecision::TF32) {
-    op->emitWarning("Ascend does not support tf32; map it to hf32.");
-    inputPrec = InputPrecision::HF32;
-  }
-  if (inputPrec == InputPrecision::HF32) {
-    auto opaElemTy = cast<RankedTensorType>(opa.getType()).getElementType();
-    auto opbElemTy = cast<RankedTensorType>(opb.getType()).getElementType();
-    if (!opaElemTy.isF32() || !opbElemTy.isF32()) {
-      inputPrec = InputPrecision::IEEE;
-    }
-  }
+
   auto createOp = [&](auto &&rewriter, ValueRange operands,
                       ValueRange results) -> Operation * {
     if (dstType.getRank() == 2)
@@ -2380,13 +2440,10 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
       }
     };
 
-    auto lhsFmt = convertFormat(lhsElemType);
-    auto rhsFmt = convertFormat(rhsElemType);
-
     Value matmulMxResult = rewriter.create<hfusion::MatMulMxOp>(
         loc, dstType, lhs, rhs, lhsScale, rhsScale, acc,
-        /*lhsFormat(optional)*/ nullptr,
-        /*rhsFormat(optional)*/ nullptr);
+        /*lhsFormat(optional)*/ convertFormat(lhsElemType),
+        /*rhsFormat(optional)*/ convertFormat(rhsElemType));
 
     Value finalResult = matmulMxResult;
     if (dstType.getElementType().isBF16()) {
