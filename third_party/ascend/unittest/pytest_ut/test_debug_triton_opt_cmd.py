@@ -155,4 +155,3 @@ def test_debug_print_uses_default_dump_dir_when_unset(capsys, monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
