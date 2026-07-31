@@ -615,7 +615,7 @@ void DataDependencyAnalysisPass::processIterArgDependencies() {
         auto realInitValue = resolveNestedIterArgInitValue(initValue);
         auto realInitDefOp = realInitValue.getDefiningOp();
         auto realInitDefReuslt = dyn_cast<mlir::OpResult>(realInitValue);
-        if (!realInitDefOp) {
+        if (!realInitDefOp || isCubeOrVectorOp(realInitDefOp)) {
           continue;
         }
         if (getCoreTypeWithIndex(realInitDefOp,
