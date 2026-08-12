@@ -22,6 +22,7 @@ import ctypes
 import functools
 import hashlib
 import glob
+import json
 import os
 import re
 import shlex
@@ -134,6 +135,8 @@ def make_ttir(mod, metadata, opt):
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
     passes.common.add_inliner(pm)
+    # passes.ttir.add_rewrite_tensor_pointer(pm)
+    passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
     passes.ttir.add_combine(pm)
     passes.common.add_canonicalizer(pm)
     passes.ttir.add_reorder_broadcast(pm)
@@ -176,7 +179,6 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         enable_select_analysis = metadata["enable_select_analysis"]
         compile_on_910_95 = metadata["compile_on_910_95"]
         force_simt_template = metadata["force_simt_template"]
-        enable_sync_block_lock = metadata["enable_sync_block_lock"]
         enable_mask_fallback_conversion = metadata["enable_mask_fallback_conversion"]
         optimize_dynamic_offset = metadata["optimize_dynamic_offset"]
         auto_blockify_size = metadata["auto_blockify_size"]
@@ -201,8 +203,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             passes.common.add_cse(pm)
             passes.common.add_canonicalizer(pm)
         ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
-        ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, force_simt_template,
-                                                               enable_sync_block_lock)
+        ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, force_simt_template)
         ascend.passes.ttir.add_triton_to_annotation(pm)
         ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, force_simt_template)
         ascend.passes.ttir.add_triton_to_hivm(pm)
@@ -224,6 +225,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             # `ssbuffer.insertionOptimization` attribute (set here) at run time.
             ascend.passes.ttir.set_enable_buffer_insert_optimization(mod, metadata["enable_buffer_insert_optimization"])
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
+
+        if _enable_msdebug():
+            ascend.passes.ttir.add_normalize_debug_line_locations(pm)
 
         _intra_val = metadata.get("intra_cache_num")
         if _intra_val is not None:
@@ -389,11 +393,21 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     metadata["shared"] = 1
     # Force disable auto tile and bind subblock if attribute is present in module
     metadata["auto_tile_and_bind_subblock"] = not re.search(DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX, linalg)
-    # Turn off auto-blockify when sync_block_lock/unlock was inserted: the lock
-    # protects a cross-block read-modify-write and is incompatible with packing
-    # logical blocks into a sequential auto-blockify loop.
-    if re.search(SYNC_BLOCK_LOCK_REGEX, linalg):
+    # Turn off auto-blockify only for the ORDERED (token-ring) sync_block_lock:
+    if re.search(SYNC_BLOCK_LOCK_REGEX, linalg) and not re.search(r"sync_block_lock_unordered", linalg):
         metadata["has_auto_blockify_blacklist_op"] = True
+    # The unordered (Bakery) discrete-mask lock cannot coexist with CV sub-tiling
+    # (auto-bind-sub-block)
+    has_unordered_sync_block_lock = re.search(r"sync_block_lock_unordered", linalg) is not None
+    metadata["has_unordered_sync_block_lock"] = has_unordered_sync_block_lock
+    if has_unordered_sync_block_lock:
+        metadata["auto_tile_and_bind_subblock"] = False
+        # One metadata cache line for runtime participant_num, plus one
+        # choosing and one ticket cache line per participant. Each cache line is
+        # 8 i64. This fallback is for one lock; the bishengir callback supplies
+        # the exact total after lowering.
+        metadata["lock_num"] = (1 + 2 * 1024) * 8
+        metadata["lock_init_val"] = 0
     # the mix mode is also encoded into metadata['name'] for runtime to distinguish
     metadata["mix_mode"] = re.search(MIX_MODE_REGEX, linalg).group(1)
     metadata["parallel_mode"] = re.search(PARALLEL_MODE_REGEX, linalg).group(1)
@@ -1091,7 +1105,6 @@ class NPUOptions:
     parallel_mode: str = "simd"
     force_simt_only: bool = False
     force_simt_template: bool = False
-    enable_sync_block_lock: bool = False
     # only take effect on the simt-only & simd-simt-mix scenarios
     shared_mem_dynamic_size: int = None
     # enable_bishengir_simt_optimization is passed as
@@ -1118,7 +1131,7 @@ class NPUOptions:
     disable_fma: bool = False
 
     # superblocking factor
-    superblock_factor: int = 0
+    superblock_factor: int = 1
 
     def __post_init__(self):
         from triton.backends.ascend import _apply_ascend_patch
@@ -1169,8 +1182,7 @@ def ttir_to_npubin(mod, metadata, opt):
                 _compile_option_list += [
                     f"--enable-bishengir-simt-optimization={opt.enable_bishengir_simt_optimization}"
                 ]
-            if opt.simt_stack_limit:
-                _compile_option_list += [f"--simt-stack-limit={opt.simt_stack_limit}"]
+            _compile_option_list += [f"--simt-stack-limit={get_simt_stack_limit()}"]
             if opt.shared_mem_dynamic_size is not None:
                 _compile_option_list += [f"--shared-mem-dynamic-size={opt.shared_mem_dynamic_size}"]
             if opt.enable_simt_reorder_instruction:
@@ -1198,7 +1210,7 @@ def ttir_to_npubin(mod, metadata, opt):
             # cap keys off the same env switch, so the two stay in sync.
             if _is_auto_map_parallel_blocks_enabled():
                 _compile_option_list += ["--enable-auto-blockify-loop"]
-                if opt.superblock_factor > 0:
+                if opt.superblock_factor > 1:
                     _compile_option_list += [f"--super-block-factor={opt.superblock_factor}"]
 
         npu_compiler_path, env = _get_npucompiler_path()
@@ -1210,6 +1222,27 @@ def ttir_to_npubin(mod, metadata, opt):
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
         return Path(bin_path).read_bytes()
+
+
+def get_simt_stack_limit():
+    # simt_stack_limit resolution precedence:
+    #  1.torch_npu's acl_default.json "StackSize":{"simt_stack_size":N}
+    #    takes precedence and the user-specified value is ignored.
+    #  2.if that config key is absent ,fail back to the kernel-time
+    #    default simt_stack_limit=1152
+    _simt_stack_limit = 1152
+    try:
+        import torch_npu
+        torch_npu_basic_path = os.path.dirname(torch_npu.__file__)
+        _acl_cfg_path = os.path.join(torch_npu_basic_path, "acl_default.json")
+        with open(_acl_cfg_path, "r") as f:
+            _acl_cfg = json.load(f)
+        _cfg_stack = _acl_cfg.get("StackSize", {}).get("simt_stack_size", None)
+        if _cfg_stack is not None and _cfg_stack > 0:
+            _simt_stack_limit = _cfg_stack
+    except Exception as e:
+        print(f"[DEBUG] read acl_default.json failed: {e}")
+    return _simt_stack_limit
 
 
 class AscendBackend(BaseBackend):

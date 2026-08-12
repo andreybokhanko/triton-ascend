@@ -19,18 +19,19 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Common.h"
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 
 #include "mlir/Analysis/AliasAnalysis.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 
@@ -45,7 +46,56 @@ namespace triton {
 
 namespace {
 
-static bool findNearestConvergence(ArrayRef<Operation *> consumers,
+static bool isInSameRegion(Operation *op, Operation *source) {
+  return op->getParentRegion() == source->getParentRegion();
+}
+
+// Walk parent chain from start to target (inclusive), deduped via inChain.
+// Caller ensures target is on start's parent chain.
+static void appendPath(Operation *start, Operation *target,
+                       const llvm::DenseMap<Operation *, Operation *> &parent,
+                       llvm::DenseSet<Operation *> &inChain,
+                       SmallVectorImpl<Operation *> &chainOps) {
+  for (Operation *pathOp = start; pathOp; pathOp = parent.lookup(pathOp)) {
+    if (inChain.insert(pathOp).second) {
+      chainOps.push_back(pathOp);
+    }
+    if (pathOp == target) {
+      break;
+    }
+  }
+}
+
+// Append convergenceOp's same-block VECTOR_ONLY direct downstream so the moved
+// op doesn't leave its tail behind.
+static void
+extendChainWithConvergenceTail(Operation *convergenceOp, Operation *source,
+                               llvm::DenseSet<Operation *> &inChain,
+                               SmallVectorImpl<Operation *> &chainOps) {
+  auto convBlockIdOpt = CVPipeline::getOpBlockId(convergenceOp);
+  if (!convBlockIdOpt || *convBlockIdOpt < 0) {
+    return;
+  }
+  int convBlockId = *convBlockIdOpt;
+  for (Operation *user : convergenceOp->getUsers()) {
+    if (CVPipeline::getOpCoreType(user) != CVPipeline::CoreType::VECTOR_ONLY) {
+      continue;
+    }
+    if (!isInSameRegion(user, source)) {
+      continue;
+    }
+    auto userBidOpt = CVPipeline::getOpBlockId(user);
+    if (!userBidOpt || *userBidOpt != convBlockId) {
+      continue;
+    }
+    if (inChain.insert(user).second) {
+      chainOps.push_back(user);
+    }
+  }
+}
+
+static bool findNearestConvergence(Operation *source,
+                                   ArrayRef<Operation *> consumers,
                                    SmallVectorImpl<Operation *> &chainOps) {
   if (consumers.size() < 2) {
     return false;
@@ -73,49 +123,29 @@ static bool findNearestConvergence(ArrayRef<Operation *> consumers,
           CVPipeline::CoreType::VECTOR_ONLY) {
         continue;
       }
+      if (!isInSameRegion(user, source)) {
+        continue;
+      }
       auto it = firstIdx.find(user);
       if (it == firstIdx.end()) {
         firstIdx[user] = myIdx;
         parent[user] = cur;
         bfsQueue.push_back({user, myIdx});
       } else if (it->second != myIdx) {
+        if (llvm::is_contained(consumers, user)) {
+          continue;
+        }
         Operation *cons1 = consumers[it->second];
         Operation *cons2 = consumers[myIdx];
         Operation *convergenceOp = user;
 
-        SmallVector<Operation *> p1;
-        for (Operation *pathOp = convergenceOp; pathOp;
-             pathOp = parent[pathOp]) {
-          p1.push_back(pathOp);
-          if (pathOp == cons1) {
-            break;
-          }
-        }
-        std::reverse(p1.begin(), p1.end());
-
-        SmallVector<Operation *> p2;
-        for (Operation *pathOp = cur; pathOp; pathOp = parent[pathOp]) {
-          p2.push_back(pathOp);
-          if (pathOp == cons2) {
-            break;
-          }
-        }
-        std::reverse(p2.begin(), p2.end());
-        p2.push_back(convergenceOp);
-
         chainOps.clear();
         llvm::DenseSet<Operation *> inChain;
-        for (Operation *op : p1) {
-          if (op != convergenceOp && inChain.insert(op).second) {
-            chainOps.push_back(op);
-          }
-        }
-        for (Operation *op : p2) {
-          if (op != convergenceOp && inChain.insert(op).second) {
-            chainOps.push_back(op);
-          }
-        }
-        chainOps.push_back(convergenceOp);
+        inChain.clear();
+        appendPath(convergenceOp, cons1, parent, inChain, chainOps);
+        appendPath(cur, cons2, parent, inChain, chainOps);
+        extendChainWithConvergenceTail(convergenceOp, source, inChain,
+                                       chainOps);
         return true;
       }
     }
@@ -132,9 +162,22 @@ static void tryMergeSource(Operation *source,
   }
   int srcBlockId = *srcBlockIdOpt;
 
+  if (mlir::isa<mlir::arith::ConstantOp>(source)) {
+    return;
+  }
+
+  // Source must be tensor-shaped; scalars have no axis semantics.
+  if (source->getNumResults() != 1 ||
+      !mlir::isa<mlir::TensorType>(source->getResult(0).getType())) {
+    return;
+  }
+
   SmallVector<Operation *> consumers;
   for (Operation *user : source->getUsers()) {
     if (CVPipeline::getOpCoreType(user) != CVPipeline::CoreType::VECTOR_ONLY) {
+      continue;
+    }
+    if (!isInSameRegion(user, source)) {
       continue;
     }
     auto bidOpt = CVPipeline::getOpBlockId(user);
@@ -148,9 +191,37 @@ static void tryMergeSource(Operation *source,
   }
 
   SmallVector<Operation *> chainOps;
-  if (!findNearestConvergence(consumers, chainOps)) {
+  if (!findNearestConvergence(source, consumers, chainOps)) {
     return;
   }
+
+  // Guard: convergenceOp's upstream operands must all live in blocks that this
+  // merge will cover
+  Operation *convergenceOp = chainOps.front();
+  for (Value operand : convergenceOp->getOperands()) {
+    Operation *defOp = operand.getDefiningOp();
+    if (!defOp) {
+      continue;
+    }
+    if (!isInSameRegion(defOp, source)) {
+      continue;
+    }
+    if (defOp == source) {
+      continue;
+    }
+    if (llvm::is_contained(chainOps, defOp)) {
+      continue;
+    }
+    auto defBidOpt = CVPipeline::getOpBlockId(defOp);
+    if (defBidOpt && *defBidOpt == srcBlockId) {
+      continue;
+    }
+    LOG_DEBUG("[tryMergeSource] convergenceOp="
+              << *convergenceOp << " has unaligned upstream defOp=" << *defOp
+              << ", skip");
+    return;
+  }
+
   LOG_DEBUG("[tryMergeSource] candidate source=" << *source << " chainSize="
                                                  << chainOps.size());
 
@@ -197,13 +268,12 @@ public:
 
     SmallVector<Operation *> candidates;
     module.walk([&](Operation *op) {
-      if (CVPipeline::getOpCoreType(op) != CVPipeline::CoreType::VECTOR_ONLY) {
+      if (CVPipeline::getOpCoreType(op) != CVPipeline::CoreType::VECTOR_ONLY ||
+          !CVPipeline::getOpBlockId(op) || op->getUsers().empty()) {
         return;
       }
-      if (!CVPipeline::getOpBlockId(op)) {
-        return;
-      }
-      if (op->getUsers().empty()) {
+      if (op->getNumResults() != 1 ||
+          !mlir::isa<mlir::TensorType>(op->getResult(0).getType())) {
         return;
       }
       candidates.push_back(op);

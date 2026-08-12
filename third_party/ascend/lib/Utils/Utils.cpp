@@ -178,7 +178,7 @@ getLastStrideOfReinterpretCastOp(memref::ReinterpretCastOp op) {
 
   OpFoldResult lastStride = mixedStrides.back();
 
-  if (op.getStaticStrides().back() > 0) {
+  if (op.getStaticStrides().back() != ShapedType::kDynamic) {
     return op.getStaticStrides().back();
   } else if (isa<BlockArgument>(op.getStrides().back())) {
     auto u = op.getStrides().back();
@@ -261,6 +261,8 @@ SmallVector<utils::IteratorType> getNParallelLoopsAttrs(unsigned n) {
 
 Value getScalarValue(Value operand, Location loc,
                      ConversionPatternRewriter &rewriter) {
+  // Peel splat / cast / select chains down to a scalar; nullptr if non-splat
+  // tensor.
   SmallVector<Operation *> ops;
   auto reconstructScalarValue = [&](Value src) {
     for (auto op = ops.rbegin(); op != ops.rend(); ++op) {
@@ -271,6 +273,13 @@ Value getScalarValue(Value operand, Location loc,
                     resType = shapedType.getElementType();
                   }
                   return rewriter.create<arith::SIToFPOp>(loc, resType, src);
+                })
+                .Case<arith::UIToFPOp>([&](Operation *op) {
+                  auto resType = op->getResults()[0].getType();
+                  if (auto shapedType = dyn_cast<ShapedType>(resType)) {
+                    resType = shapedType.getElementType();
+                  }
+                  return rewriter.create<arith::UIToFPOp>(loc, resType, src);
                 })
                 .Case<arith::TruncFOp>([&](Operation *op) {
                   auto resType = op->getResults()[0].getType();
@@ -292,33 +301,54 @@ Value getScalarValue(Value operand, Location loc,
       return reconstructScalarValue(operand);
     } else if (auto op = operand.getDefiningOp<arith::ConstantOp>()) {
       if (auto attr = dyn_cast<DenseElementsAttr>(op.getValue())) {
-        if (!attr.isSplat()) {
-          InFlightDiagnostic diag = emitError(loc)
-                                    << "other value used in masked load "
-                                       "produced by unsupported instruction";
+        if (!attr.isSplat())
           return nullptr;
-        }
         auto elemValue = attr.getSplatValue<Attribute>();
         auto constOp = arith::ConstantOp::materialize(
             rewriter, elemValue, attr.getElementType(), op.getLoc());
         return reconstructScalarValue(constOp.getResult());
       }
-      InFlightDiagnostic diag = emitError(loc)
-                                << "other value used in masked load produced "
-                                   "by unsupported instruction";
       return nullptr;
     } else if (auto op = operand.getDefiningOp<triton::SplatOp>()) {
       operand = op.getSrc();
+    } else if (auto op = operand.getDefiningOp<arith::SelectOp>()) {
+      // Descriptor padding: select(i1, splat_nan, splat_zero) -> scalar select.
+      Value trueVal = getScalarValue(op.getTrueValue(), loc, rewriter);
+      Value falseVal = getScalarValue(op.getFalseValue(), loc, rewriter);
+      if (!trueVal || !falseVal)
+        return nullptr;
+      Value cond = op.getCondition();
+      if (isa<ShapedType>(cond.getType())) {
+        if (auto splat = cond.getDefiningOp<triton::SplatOp>())
+          cond = splat.getSrc();
+        else if (auto c = cond.getDefiningOp<arith::ConstantOp>()) {
+          if (auto attr = dyn_cast<DenseElementsAttr>(c.getValue());
+              attr && attr.isSplat()) {
+            cond = arith::ConstantOp::materialize(
+                rewriter, attr.getSplatValue<Attribute>(),
+                attr.getElementType(), c.getLoc());
+          } else {
+            return nullptr;
+          }
+        } else {
+          return nullptr;
+        }
+      }
+      if (isa<ShapedType>(cond.getType()))
+        return nullptr;
+      Value scalarSelect = rewriter.create<arith::SelectOp>(
+          loc, trueVal.getType(), cond, trueVal, falseVal);
+      return reconstructScalarValue(scalarSelect);
     } else if (auto op = operand.getDefiningOp<arith::SIToFPOp>()) {
+      ops.push_back(op.getOperation());
+      operand = op.getIn();
+    } else if (auto op = operand.getDefiningOp<arith::UIToFPOp>()) {
       ops.push_back(op.getOperation());
       operand = op.getIn();
     } else if (auto op = operand.getDefiningOp<arith::TruncFOp>()) {
       ops.push_back(op.getOperation());
       operand = op.getIn();
     } else {
-      InFlightDiagnostic diag = emitError(loc)
-                                << "other value used in masked load produced "
-                                   "by unsupported instruction";
       return nullptr;
     }
   }
