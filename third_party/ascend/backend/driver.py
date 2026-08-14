@@ -732,15 +732,21 @@ static void release_npu_tensor_handle(void* handle) {{
     # and the program-id/grid axis it applies to. Each program now covers H tiles
     # along that axis, so the host shrinks the matching grid dim by H here (the
     # equivalent of what bishengir AutoBlockify used to do via hacc.coalesce_factor;
-    # bishengir no longer touches it). The division is unconditional and mirrors the
-    # old integer division -- the kernel rewrite assumes grid[axis] % H == 0.
+    # bishengir no longer touches it). RowCoalescing can request ceil-div because
+    # its generated row mask handles tail rows.
     coalesce_factor = int(getattr(metadata, "coalesce_factor", 1) or 1)
     coalesce_axis = int(getattr(metadata, "coalesce_axis", -1))
+    coalesce_grid_ceil_div = bool(getattr(metadata, "coalesce_grid_ceil_div", False))
     if coalesce_factor > 1 and coalesce_axis in (0, 1, 2):
         _coalesce_grid_var = {0: "gridX", 1: "gridY", 2: "gridZ"}[coalesce_axis]
-        coalesce_grid_div = (f"// coalescing: each program covers {coalesce_factor} tiles along "
-                             f"axis {coalesce_axis}; shrink that grid dim.\n"
-                             f"  {_coalesce_grid_var} = {_coalesce_grid_var} / {coalesce_factor};")
+        _coalesce_grid_expr = (f"({_coalesce_grid_var} + {coalesce_factor} - 1) / {coalesce_factor}"
+                               if coalesce_grid_ceil_div else f"{_coalesce_grid_var} / {coalesce_factor}")
+        coalesce_grid_div = (
+            f"// coalescing: each program covers {coalesce_factor} tiles along "
+            f"axis {coalesce_axis}; shrink that grid dim.\n" +
+            ("" if coalesce_grid_ceil_div else f"  assert({_coalesce_grid_var} % {coalesce_factor} == 0 && "
+             f"\"ChunkCoalescing: grid[{coalesce_axis}] not divisible by coalesce_factor {coalesce_factor}\");\n") +
+            f"  {_coalesce_grid_var} = {_coalesce_grid_expr};")
     else:
         coalesce_grid_div = ""
 
@@ -797,7 +803,6 @@ extern "C" {
   extern int MsprofRegisterCallback(unsigned int moduleId, callback handle);
   static unsigned int __MsprofFlagL0  = 0;
   static unsigned int __MsprofFlagL1  = 0;
-  static const char* kernelName = nullptr ;
   static std::vector<int> tensorKinds;
 
   int ProfCtrlHandle(unsigned int CtrlType, void* CtrlData, unsigned int DataLen) {
@@ -1023,7 +1028,7 @@ void triton_launch_kernel(const char* kernelName, aclrtFuncHandle func, aclrtStr
   // only 1D parallelization is supported for NPU
   // Pointer type becomes flattend 1-D Memref tuple: base_ptr, data_ptr, offset, shape, stride
   // base_ptr offset shape and stride are not used, arbitrarily set for now
-  static std::string name(kernelName);
+  std::string name(kernelName);
   void *workspace_addr_ptr = NULL;
   void *workspace_handle = NULL;
   {coalesce_grid_div}
@@ -1131,7 +1136,7 @@ static void _launch(const char* kernelName, aclrtFuncHandle func, aclrtStream st
     printf("WARNING: Skipping launch for kernel '%s' due to empty grid (gridX=%d, gridY=%d, gridZ=%d).\\n", kernelName, gridX, gridY, gridZ);
     return;
   }}
-  static std::string name(kernelName);
+  std::string name(kernelName);
   void *workspace_addr_ptr = NULL;
   void *workspace_handle = NULL;
   {coalesce_grid_div}
@@ -1279,10 +1284,8 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
 
   // get kernel_name
-  if (!kernelName) {{
-      PyObject *kernelNameObj = PyDict_GetItemString(packedMetadata, "kernel_name");
-      kernelName = PyUnicode_AsUTF8(kernelNameObj);
-  }}
+  PyObject *kernelNameObj = PyDict_GetItemString(packedMetadata, "kernel_name");
+  const char* kernelName = PyUnicode_AsUTF8(kernelNameObj);
   // get tensor_kinds
   if( tensorKinds.empty() ) {{
      PyObject *tensorKindList = PyDict_GetItemString(packedMetadata, "tensor_kinds");

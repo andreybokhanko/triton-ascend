@@ -151,6 +151,18 @@ static bool hasOnlySupportedPointerUses(Value pointer) {
         return false;
       continue;
     }
+    if (auto expandDimsOp = dyn_cast<triton::ExpandDimsOp>(user)) {
+      if (expandDimsOp.getSrc() != pointer ||
+          !hasOnlySupportedPointerUses(expandDimsOp.getResult()))
+        return false;
+      continue;
+    }
+    if (auto broadcastOp = dyn_cast<triton::BroadcastOp>(user)) {
+      if (broadcastOp.getSrc() != pointer ||
+          !hasOnlySupportedPointerUses(broadcastOp.getResult()))
+        return false;
+      continue;
+    }
     if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
       if (loadOp.getPtr() != pointer)
         return false;
@@ -172,16 +184,15 @@ static bool canRewriteSupportedPointerBitcast(triton::BitcastOp op) {
     return false;
 
   Value current = op.getSrc();
-  bool seenTensorAddPtr = false;
   while (Operation *producer = current.getDefiningOp()) {
     if (auto addPtrOp = dyn_cast<triton::AddPtrOp>(producer)) {
       Type offsetType = addPtrOp.getOffset().getType();
       if (isa<RankedTensorType>(current.getType())) {
-        if (seenTensorAddPtr)
-          return false;
-        seenTensorAddPtr = true;
+        auto pointerType = cast<RankedTensorType>(current.getType());
         auto tensorType = dyn_cast<RankedTensorType>(offsetType);
-        if (!tensorType || !tensorType.hasStaticShape())
+        if (!pointerType.hasStaticShape() || !tensorType ||
+            !tensorType.hasStaticShape() ||
+            pointerType.getShape() != tensorType.getShape())
           return false;
         auto elementType = dyn_cast<IntegerType>(tensorType.getElementType());
         if (!elementType ||
@@ -230,13 +241,32 @@ rewriteSupportedPointerBitcast(triton::BitcastOp op, IRRewriter &rewriter,
     return success();
   }
 
-  if (auto addPtrOp = src.getDefiningOp<triton::AddPtrOp>()) {
+  if (src.getDefiningOp<triton::AddPtrOp>()) {
+    Value base = src;
+    Value byteOffset;
+    while (auto currentAddPtr = base.getDefiningOp<triton::AddPtrOp>()) {
+      Value currentOffset = currentAddPtr.getOffset();
+      auto offsetType = cast<RankedTensorType>(currentOffset.getType());
+      auto elementType = cast<IntegerType>(offsetType.getElementType());
+      if (elementType.getWidth() < 64) {
+        auto i64OffsetType =
+            RankedTensorType::get(offsetType.getShape(), rewriter.getI64Type());
+        currentOffset = rewriter.create<arith::ExtSIOp>(
+            op.getLoc(), i64OffsetType, currentOffset);
+      }
+      if (byteOffset)
+        byteOffset = rewriter.create<arith::AddIOp>(op.getLoc(), byteOffset,
+                                                    currentOffset);
+      else
+        byteOffset = currentOffset;
+      base = currentAddPtr.getPtr();
+    }
     auto scaledOffset =
-        scaleTensorPointerOffset(addPtrOp.getOffset(), *divisor, rewriter);
+        scaleTensorPointerOffset(byteOffset, *divisor, rewriter);
     if (failed(scaledOffset))
       return failure();
-    nextBitcast = rewriter.create<triton::BitcastOp>(op.getLoc(), op.getType(),
-                                                     addPtrOp.getPtr());
+    nextBitcast =
+        rewriter.create<triton::BitcastOp>(op.getLoc(), op.getType(), base);
     auto newAddPtr = rewriter.create<triton::AddPtrOp>(
         op.getLoc(), op.getType(), nextBitcast, *scaledOffset);
     rewriter.replaceOp(op, newAddPtr.getResult());
@@ -377,6 +407,24 @@ static bool canUseIndirectFastPath(Value srcPtr, Value ptrOffset) {
   return isa<RankedTensorType>(ptrOffset.getType());
 }
 
+// Wrap an int_to_ptr result with addptr(src, 0) so that the later
+// AddPtrConverter can lower it to a hivm::PointerCastOp (memref type), which
+// the IndirectLoad/StoreConverter needs to emit func.call @triton_indirect_*.
+// Returns the wrapped pointer, or the original srcPtr when it is not an
+// int_to_ptr result.
+static Value wrapIntToPtrWithAddPtr(Value srcPtr, Location loc,
+                                    PatternRewriter &rewriter) {
+  if (auto *defOp = srcPtr.getDefiningOp()) {
+    if (auto intToPtrOp = dyn_cast<triton::IntToPtrOp>(defOp)) {
+      auto zeroOffset = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getZeroAttr(intToPtrOp.getSrc().getType()));
+      return rewriter.create<triton::AddPtrOp>(loc, srcPtr.getType(), srcPtr,
+                                               zeroOffset);
+    }
+  }
+  return srcPtr;
+}
+
 template <typename MemAccOpTy>
 LogicalResult tryRewriteIndirectFastPath(MemAccOpTy op, Location loc,
                                          Value srcPtr, Value ptrOffset,
@@ -403,15 +451,7 @@ LogicalResult tryRewriteIndirectFastPath(MemAccOpTy op, Location loc,
     Value mask = op.getMask();
     Value other = op.getOther();
     auto resultType = op.getType();
-    auto newPtr = srcPtr;
-    if (auto *defOp = srcPtr.getDefiningOp()) {
-      if (auto intToPtrOp = dyn_cast<triton::IntToPtrOp>(defOp)) {
-        auto zeroOffset = rewriter.create<arith::ConstantOp>(
-            loc, rewriter.getZeroAttr(intToPtrOp.getSrc().getType()));
-        newPtr = rewriter.create<triton::AddPtrOp>(loc, srcPtr.getType(),
-                                                   srcPtr, zeroOffset);
-      }
-    }
+    auto newPtr = wrapIntToPtrWithAddPtr(srcPtr, loc, rewriter);
     auto indirect = rewriter.create<triton::ascend::IndirectLoadOp>(
         loc, resultType, newPtr, ptrOffset, mask, other,
         ConverterUtils::requiresVolatileIndirectLoad(op.getPtr(), op));
@@ -431,6 +471,11 @@ LogicalResult tryRewriteIndirectFastPath(MemAccOpTy op, Location loc,
            "src must be ptr type");
     Value value = op.getValue();
     Value mask = op.getMask();
+
+    // Wrap int_to_ptr with addptr so that AddPtrConverter can later produce
+    // a hivm::PointerCastOp (memref type) from it, which is required by
+    // IndirectStoreConverter to emit func.call @triton_indirect_store.
+    srcPtr = wrapIntToPtrWithAddPtr(srcPtr, loc, rewriter);
 
     // For bool store, unwrap ptr<i1> -> ptr<i8> bitcast before creating
     // indirect_store. Keep ptr<i1> so TypeConverter can map it to memref<?xi8>.
