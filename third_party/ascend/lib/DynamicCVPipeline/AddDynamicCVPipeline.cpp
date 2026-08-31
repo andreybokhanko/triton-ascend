@@ -98,18 +98,20 @@ void AddDynamicCVPipelinePass::runOnOperation() {
         // pipeline correctly decided this kernel is not a fit
         // (no matmul, already scope-optimized, unsupported pattern) --
         // just print a message, no IR.
-        mlir::emitWarning(moduleOp->getLoc()) << "[" << DEBUG_TYPE << "] "
-                                              << "Kernel not applicable for dynamic CV pipeline "
-                                                 "(no matmul / already scope-optimized / unsupported "
-                                                 "pattern); falling back to standard compilation.";
+        mlir::emitWarning(moduleOp->getLoc())
+            << "[" << DEBUG_TYPE << "] "
+            << "Kernel not applicable for dynamic CV pipeline "
+               "(no matmul / already scope-optimized / unsupported "
+               "pattern); falling back to standard compilation.";
       } else {
         // a sub-pass genuinely failed (UB overflow, flag-budget
         // exhaustion, unsupported while-condition, i1 cross-block dep, ...) --
         // print a warning message and print module IR.
-        moduleOp->emitWarning() << "[" << DEBUG_TYPE << "] "
-                                << "Pass failed (errcode=" << errCode << "); "
-                                   "falling back to compilation without "
-                                   "dynamic CV pipeline.";
+        moduleOp->emitWarning()
+            << "[" << DEBUG_TYPE << "] " << "Pass failed (errcode=" << errCode
+            << "); "
+               "falling back to compilation without "
+               "dynamic CV pipeline.";
       }
     }
 
