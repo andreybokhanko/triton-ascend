@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+import importlib.metadata
 from pathlib import Path
 import tempfile
 import os
@@ -47,32 +48,57 @@ class NPUUtils(object):
         return cls.instance
 
     def __init__(self):
+        # NPUUtils is a singleton, but __init__ must refresh the cached shared
+        # object path on every construction. PyTorch Inductor may set
+        # TRITON_CACHE_DIR after the driver first initializes, so keeping the
+        # first path would make the launcher look for npu_utils.so in a newer
+        # cache root where it was never built.
+        self._cache_path = self._build_or_get_cached_so()
+        if not hasattr(self, "npu_utils_mod"):
+            self.npu_utils_mod = None
+
+    def get_so_path(self):
+        if self._cache_path is None:
+            self._cache_path = self._build_or_get_cached_so()
+        return self._cache_path
+
+    def _build_or_get_cached_so(self):
         dirname = os.path.dirname(os.path.realpath(__file__))
         src_path = os.path.join(dirname, "npu_utils.cpp")
         src = Path(src_path).read_text()
-        version_info = get_backend_func("version_hash")
         cann_version = get_cann_version()
         cann_version_str = ".".join(map(str, cann_version)) if cann_version else ""
-        key = hashlib.md5((src + "_".join(version_info) + "_" + cann_version_str).encode("utf-8")).hexdigest()
+        torch_npu_version = importlib.metadata.version("torch_npu")
+        key_parts = [cann_version_str, torch_npu_version, src]
+        key = hashlib.md5("\0".join(key_parts).encode("utf-8")).hexdigest()
         cache = get_cache_manager(key)
         fname = "npu_utils.so"
         cache_path = cache.get_file(fname)
-        if cache_path is None or not os.path.exists(cache_path):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp_src_path = os.path.join(tmpdir, "npu_utils.cpp")
-                with open(tmp_src_path, "w") as f:
-                    f.write(src)
-                so = _build_npu_ext("npu_utils", tmp_src_path)
-                with open(so, "rb") as f:
-                    cache_path = cache.put(f.read(), fname, binary=True)
+        if cache_path is not None and os.path.exists(cache_path):
+            return cache_path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_src_path = os.path.join(tmpdir, "npu_utils.cpp")
+            with open(tmp_src_path, "w") as f:
+                f.write(src)
+            so = _build_npu_ext("npu_utils", tmp_src_path)
+            with open(so, "rb") as f:
+                cache_path = cache.put(f.read(), fname, binary=True)
+        return cache_path
+
+    def _load_mod(self):
+        if self.npu_utils_mod is not None:
+            return self.npu_utils_mod
+
         import importlib.util
-        spec = importlib.util.spec_from_file_location("npu_utils", cache_path)
+        spec = importlib.util.spec_from_file_location("npu_utils", self.get_so_path())
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         self.npu_utils_mod = mod
+        return self.npu_utils_mod
 
     def load_binary(self, name, kernel, shared, device, mix_mode):
-        return self.npu_utils_mod.load_kernel_binary(name, kernel, shared, device, mix_mode)
+        return self._load_mod().load_kernel_binary(name, kernel, shared, device, mix_mode)
 
     def _get_npu_device_limit_form_env(self) -> tuple[int, int]:
         """Read and validate the NPU_DEVICE_LIMIT env var, return the capped AICore and AIVector counts.
@@ -126,7 +152,11 @@ class NPUUtils(object):
                     f"not equal device properties vector_core_num/cube_core_num({num_aiv}/{num_aic}={quotient_decimal}) ratio."
                 )
             else:
-                print(f"[INFO]NPU_DEVICE_LIMIT from env: cube_core_num={num_aic_env},vector_core_num={num_aiv_env}).")
+                debug = os.getenv("TRITON_DEBUG", 'false').lower() in ('true', '1')
+                if debug:
+                    print(
+                        f"[DEBUG]NPU_DEVICE_LIMIT from env: cube_core_num={num_aic_env},vector_core_num={num_aiv_env})."
+                    )
                 return num_aic_env, num_aiv_env
         else:
             raise ValueError(f"[ERROR]NPU_DEVICE_LIMIT={npu_device_limit_str}, which has invalid format: "
@@ -156,7 +186,7 @@ class NPUUtils(object):
 
     def get_arch(self):
         # temporarily return empty arch descriptor
-        return self.npu_utils_mod.get_arch()
+        return self._load_mod().get_arch()
 
     def get_aicore_num(self):
         # temporarily return empty arch descriptor
@@ -932,8 +962,7 @@ def make_launcher(constants, signature, metadata):
     alloc_success_code = 'return 1;'
     sync_lock_fail_code = 'fprintf(stderr, "Error: syncBlockLock allocation failed\\n"); return;'
     workspace_fail_code = 'fprintf(stderr, "Error: workspace allocation failed\\n"); return;'
-    npu_utils_mod = getattr(npu_utils, "npu_utils_mod", None)
-    npu_utils_so_path = getattr(npu_utils_mod, "__file__", "")
+    npu_utils_so_path = NPUUtils().get_so_path()
     # The generated launcher source is part of its cache key. Preserve only the
     # deterministic cache-key directory so the launcher can be reused after the
     # cache root changes.
@@ -1286,7 +1315,9 @@ void triton_launch_kernel(const char* kernelName, cann_func_handle func, cann_st
     size_t grid_offset = reserve_slot(sizeof(int32_t), 4);
     reserve_slot(sizeof(int32_t), 4);
     reserve_slot(sizeof(int32_t), 4);
-    {'size_t dtdata_offset = reserve_slot(sizeof(void*), 8);' if enable_device_print else ''}
+    {'reserve_slot(sizeof(void*), 8);' if metadata.is_pure_simt else ''}
+    {'reserve_slot(sizeof(void*), 8);' if metadata.is_pure_simt else ''}
+    {'size_t dtdata_offset = reserve_slot(sizeof(void*), 8);' if enable_device_print else 'reserve_slot(sizeof(void*), 8);'}
     size_t total_size = args_offset;
 
     std::vector<char> launch_args(total_size, 0);
@@ -1324,7 +1355,9 @@ static void _launch(const char* kernelName, cann_func_handle func, cann_stream s
       {'void* workspace_addr __attribute__((aligned(8)));' if not metadata.is_pure_simt else ''}
       {' '.join(f'{ty_to_cpp(ty)} arg{i} __attribute__((aligned({4 if ty[0] != "*" and ty[-2:] != "64" else 8})));' for i, ty in signature.items() if ty != "constexpr")}
       {' '.join(f'{ty_to_cpp(ty)} grid{mark} __attribute__((aligned(4)));' for mark, ty in grid_info.items())}
-      {'void* DTData __attribute__((aligned(8)));' if enable_device_print else ''}
+      {'void* global_scratch __attribute__((aligned(8)));' if metadata.is_pure_simt else ''}
+      {'void* profile_scratch __attribute__((aligned(8)));' if metadata.is_pure_simt else ''}
+      {'void* DTData __attribute__((aligned(8)));'}
     }} args = {{
       {'static_cast<void*>(ffts_addr),' if target_support_ffts else ''}
       {('static_cast<void*>(syncBlockLock_ptr),' if has_sync_block_lock else 'nullptr,') if not metadata.is_pure_simt else ''}
@@ -1333,7 +1366,9 @@ static void _launch(const char* kernelName, cann_func_handle func, cann_stream s
         [f'static_cast<{ty_to_cpp(ty)}>(arg{i})' for i, ty in signature.items() if ty != "constexpr"]
       )}
       {', '.join(f'static_cast<{ty_to_cpp(ty)}>(grid{mark})' for mark, ty in grid_info.items())}
-      {', static_cast<void*>(DTData)' if enable_device_print else ''}
+      {', static_cast<void*>(nullptr)' if metadata.is_pure_simt else ''}
+      {', static_cast<void*>(nullptr)' if metadata.is_pure_simt else ''}
+      {', static_cast<void*>(DTData)' if enable_device_print else ', static_cast<void*>(nullptr)'}
     }};
 {_launch_lambda_post.replace('__KERNEL_LAUNCH_CALL__', cpp_kernel_launch_local)}
 

@@ -51,6 +51,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/TypeRange.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
@@ -807,6 +808,19 @@ static bool isSIMTOp(Operation *op) {
       return isSimt1DCumsum(scan);
     }
   }
+
+  // math.sin / math.cos on f16/f32 inputs: downstream (A5 RegBase normalize,
+  // enable-high-precision defaults to true) rewrites them into a Payne-Hanek
+  // range reduction that looks up a 320xi32 2/pi limbs table with two
+  // hfusion.gather ops per collapsed region.  Match that scenario here and
+  // route it to the SIMT template so the table gathers run in SIMT.
+  if (compileOn91095Flag && (isa<math::SinOp>(op) || isa<math::CosOp>(op))) {
+    Type inElem = getElementTypeOrSelf(op->getOperand(0).getType());
+    if (inElem.isF16() || inElem.isF32()) {
+      return true;
+    }
+  }
+
   return isa<triton::ascend::IndexPutOp, triton::ascend::GatherOutToUbOp,
              triton::ascend::ScatterUbToOutOp, triton::ascend::IndirectLoadOp,
              triton::ascend::StrideLoadOp, triton::ascend::StrideStoreOp,
@@ -1680,27 +1694,19 @@ void TritonToLinalgPass::runOnOperation() {
     return;
   }
 
-  // Check if the kernel contains tl.dot. Without tl.dot,
-  // the kernel would be pure AIV kernel.
+  // Check if the kernel contains a cube op: tl.dot / tl.dot_scaled / al.dot
+  // decompose into a cube linalg.matmul, and conv1d/conv2d run on the cube
+  // unit. Without any of them the kernel would be tagged as a pure AIV kernel;
+  // with them it must be tagged mix mode, otherwise the cube tile-and-slice
+  // fails (cbuf overflow).
   bool existDot = false;
-  moduleOp.walk([&](triton::DotOp dotOp) {
-    existDot = true;
-    return WalkResult::interrupt();
-  });
-  moduleOp.walk([&](triton::DotScaledOp dotScaledOp) {
-    existDot = true;
-    return WalkResult::interrupt();
-  });
-  // dot decomposes into a cube linalg.matmul, so a kernel containing it is
-  // a cube (mix) kernel, not a pure-AIV one. Without this the func gets tagged
-  // mix_mode="aiv" and the cube tile-and-slice fails (cbuf overflow).
-  moduleOp.walk([&](triton::ascend::DotOp dotOp) {
-    existDot = true;
-    return WalkResult::interrupt();
-  });
-  moduleOp.walk([&](hfusion::Conv1DOp conv1dOp) {
-    existDot = true;
-    return WalkResult::interrupt();
+  moduleOp.walk([&](Operation *op) {
+    if (isa<triton::DotOp, triton::DotScaledOp, triton::ascend::DotOp,
+            hfusion::Conv1DOp, hfusion::Conv2DOp>(op)) {
+      existDot = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
   });
   existDotFlag = existDot;
 
