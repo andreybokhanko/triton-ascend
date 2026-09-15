@@ -143,6 +143,11 @@ bool isExternalSyncOp(Operation *op) {
          op->getAttrOfType<IntegerAttr>(CVPipeline::kExternalSync);
 }
 
+void setSubBlockId(Operation *op, int subBlockId) {
+  OpBuilder builder(op->getContext());
+  op->setAttr(CVPipeline::kSubBlock, builder.getI32IntegerAttr(subBlockId));
+}
+
 bool isScfOp(Operation *op) {
   return llvm::isa<scf::SCFDialect>(op->getDialect());
 }
@@ -219,7 +224,9 @@ CoreType getCoreTypeOfSimpleOpOrCf(Operation *op) {
   }
   auto funcOp = op->getParentOfType<func::FuncOp>();
   if (funcOp) {
-    constexpr llvm::StringLiteral regionalDisabledOps[]{
+    constexpr llvm::StringLiteral regionalDisabledOps[4]{
+        "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64",
+        "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
         "chunk_ttt_linear_fwd_kernel_h", "chunk_ttt_linear_bwd_kernel_h"};
     if (llvm::is_contained(regionalDisabledOps, funcOp.getSymName())) {
       return CoreType::UNDETERMINED;
@@ -480,6 +487,15 @@ int getLoopCarriedArgIndex(Value operand, Block *block) {
   }
 
   return argIdx;
+}
+
+int getTensorIterArgIndex(Value v, ArrayRef<Value> iterArgs) {
+  for (unsigned i = 0; i < iterArgs.size(); ++i) {
+    if (v == iterArgs[i] && isa<RankedTensorType>(iterArgs[i].getType())) {
+      return i;
+    }
+  }
+  return -1;
 }
 
 std::optional<hivm::FixpipePreQuantMode> getFixpipePreQuantMode(Operation *op) {
