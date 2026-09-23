@@ -95,6 +95,42 @@ static Value unwrapRuntimeExtentUnsignedOperand(Value operand,
   return builder.create<triton::SplatOp>(loc, narrowedType, extend.getIn());
 }
 
+// Follow an i1 tensor to its init only when all corresponding loop edges
+// forward the same value. A while may permute condition/result slots, so do
+// not assume its before and after argument numbers are interchangeable.
+Value getInvariantLoopMaskInit(BlockArgument argument) {
+  Operation *parent = argument.getOwner()->getParentOp();
+  if (auto loop = dyn_cast<scf::ForOp>(parent)) {
+    if (argument == loop.getInductionVar())
+      return {};
+    unsigned slot = argument.getArgNumber() - 1;
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    return yield.getOperand(slot) == argument ? loop.getInitArgs()[slot]
+                                              : Value();
+  }
+  if (auto loop = dyn_cast<scf::WhileOp>(parent)) {
+    auto condition = loop.getConditionOp();
+    auto yield = loop.getYieldOp();
+    BlockArgument before, after;
+    if (argument.getOwner() == &loop.getBefore().front()) {
+      before = argument;
+      after = dyn_cast<BlockArgument>(yield.getOperand(before.getArgNumber()));
+      if (!after || after.getOwner() != &loop.getAfter().front() ||
+          condition.getArgs()[after.getArgNumber()] != before)
+        return {};
+    } else {
+      after = argument;
+      before =
+          dyn_cast<BlockArgument>(condition.getArgs()[after.getArgNumber()]);
+      if (!before || before.getOwner() != &loop.getBefore().front() ||
+          yield.getOperand(before.getArgNumber()) != after)
+        return {};
+    }
+    return loop.getInits()[before.getArgNumber()];
+  }
+  return {};
+}
+
 } // namespace
 
 OpFoldResult MaskState::clampToNonNegativeIndex(const OpFoldResult value,
@@ -124,6 +160,11 @@ LogicalResult MaskState::parse(Value operand, const Location &loc,
   if (auto blockArgument = dyn_cast<BlockArgument>(operand)) {
     auto parentOp = blockArgument.getOwner()->getParentOp();
     if (auto loopOp = dyn_cast<LoopLikeOpInterface>(parentOp)) {
+      auto type = dyn_cast<RankedTensorType>(operand.getType());
+      if (type && type.getElementType().isInteger(1)) {
+        Value init = getInvariantLoopMaskInit(blockArgument);
+        return init ? parse(init, loc, builder) : failure();
+      }
       OpOperand *initArgOperand = loopOp.getTiedLoopInit(blockArgument);
       if (initArgOperand) {
         if (!isa<ShapedType>(operand.getType()))
@@ -179,25 +220,35 @@ LogicalResult MaskState::parse(Value operand, const Location &loc,
 
         // The iteration count n = (iv - lb) / step relates the induction
         // variable to the per-iteration increment: current = init + n*delta.
-        // lb/step must be compile-time constants
-        auto lb = getConstantIntValue(forOp.getLowerBound());
-        auto step = getConstantIntValue(forOp.getStep());
-        if (!lb || !step || *step == 0)
-          return failure();
-
+        // lb/step may be dynamic; cast to index and compute at runtime.
         FailureOr<Value> ivIndex = castIntegerLike(
             builder, loc, forOp.getInductionVar(), builder.getIndexType());
         if (failed(ivIndex))
           return failure();
 
         Value iterCount = *ivIndex;
-        if (*lb != 0) {
-          auto lbCst = builder.create<arith::ConstantIndexOp>(loc, *lb);
-          iterCount = builder.create<arith::SubIOp>(loc, iterCount, lbCst);
+
+        // iterCount = iv - lb  (handle dynamic or constant lb)
+        auto lb = getConstantIntValue(forOp.getLowerBound());
+        if (!lb || *lb != 0) {
+          FailureOr<Value> lbIndex = castIntegerLike(
+              builder, loc, forOp.getLowerBound(), builder.getIndexType());
+          if (failed(lbIndex))
+            return failure();
+          iterCount = builder.create<arith::SubIOp>(loc, iterCount, *lbIndex);
         }
-        if (*step != 1) {
-          auto stepCst = builder.create<arith::ConstantIndexOp>(loc, *step);
-          iterCount = builder.create<arith::DivSIOp>(loc, iterCount, stepCst);
+
+        // iterCount = (iv - lb) / step  (handle dynamic or constant step)
+        auto stepCst = getConstantIntValue(forOp.getStep());
+        if (stepCst && *stepCst == 0)
+          return failure();
+        if (!stepCst || *stepCst != 1) {
+          FailureOr<Value> stepIndex = castIntegerLike(
+              builder, loc, forOp.getStep(), builder.getIndexType());
+          if (failed(stepIndex))
+            return failure();
+          iterCount =
+              builder.create<arith::DivSIOp>(loc, iterCount, *stepIndex);
         }
 
         OpFoldResult offset =
