@@ -118,3 +118,59 @@ def test_two_structured_axes(slo, shi, rlo, rhi):
     _two_structured_axes[(1, )](source.npu(), output, slo, shi, rlo, rhi, nr, multibuffer=False)
     torch.npu.synchronize()
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+
+
+@triton.jit
+def _mixed_axis_column_loop(input_ptr, output_ptr, rows, width, out_stride, TENSOR_OTHER: tl.constexpr):
+    x = tl.program_id(0) * 32 + tl.arange(0, 32)[:, None]
+    rbase = tl.arange(0, 64)[None, :]
+    for start in range(0, width, 64):
+        r = start + rbase
+        # Irregular rows, contiguous columns and a runtime column tail. The
+        # row predicate is loop-covered; the column predicate must survive.
+        mask = (x < rows) & (r < width)
+        other = (x * 1000 + r).to(tl.float32) if TENSOR_OTHER else -7.0
+        value = tl.load(input_ptr + (x % 5) * width + r, mask, other=other)
+        tl.store(output_ptr + x * out_stride + r, value)
+
+
+@pytest.mark.parametrize("width", [63, 64, 65, 130, 512])
+@pytest.mark.parametrize("rows", [0, 1, 33])
+@pytest.mark.parametrize("tensor_other", [False, True])
+@pytest.mark.parametrize("multibuffer", [False, True])
+def test_mixed_axis_column_loop(width, rows, tensor_other, multibuffer):
+    nr, nc = max(triton.cdiv(rows, 32), 1) * 32, triton.cdiv(width, 64) * 64
+    source = torch.arange(5 * width, dtype=torch.float32).reshape(5, width)
+    x, r = torch.arange(nr)[:, None], torch.arange(nc)[None, :]
+    expected = (x * 1000 + r).float() if tensor_other else torch.full((nr, nc), -7.0)
+    expected[:rows, :width] = source[torch.arange(rows) % 5]
+    output = torch.empty((nr, nc), dtype=torch.float32, device="npu")
+    _mixed_axis_column_loop[(nr // 32, )](source.npu(), output, rows, width, nc, tensor_other, multibuffer=multibuffer)
+    torch.npu.synchronize()
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+
+
+@triton.jit
+def _mixed_axis_row_gate(input_ptr, output_ptr, lower, upper, width, gate, EQUALITY: tl.constexpr):
+    x = tl.arange(0, 8)[:, None]
+    r = tl.arange(0, 32)[None, :]
+    row_mask = (x == lower) if EQUALITY else ((x >= lower) & (x < upper))
+    mask = row_mask & (r < width) & gate
+    value = tl.load(input_ptr + (x % 2) * width + r, mask, other=-7.0)
+    tl.store(output_ptr + x * 32 + r, value)
+
+
+@pytest.mark.parametrize("lower,upper,equality", [(-5, 3, False), (2, 7, False), (7, 2, False), (-5, 8, True),
+                                                  (3, 8, True)])
+@pytest.mark.parametrize("gate", [False, True])
+def test_mixed_axis_row_gate(lower, upper, equality, gate):
+    width = 20
+    source = torch.arange(2 * width, dtype=torch.float32).reshape(2, width)
+    x = torch.arange(8)
+    valid = ((x == lower) if equality else ((x >= lower) & (x < upper))) & gate
+    expected = torch.full((8, 32), -7.0)
+    expected[valid, :width] = source[x[valid] % 2]
+    output = torch.empty_like(expected, device="npu")
+    _mixed_axis_row_gate[(1, )](source.npu(), output, lower, upper, width, gate, equality, multibuffer=False)
+    torch.npu.synchronize()
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)

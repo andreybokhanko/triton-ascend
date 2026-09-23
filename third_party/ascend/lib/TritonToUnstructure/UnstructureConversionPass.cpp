@@ -381,6 +381,32 @@ static bool canUseIndirectFastPath(Value srcPtr, Value ptrOffset) {
   return isa<RankedTensorType>(ptrOffset.getType());
 }
 
+static bool isMaskOutTensorLanes(const std::optional<MaskState> &maskState,
+                                 ArrayRef<int64_t> tensorShape) {
+  // MaskState describes an axis-aligned active slice as [offset, offset + dim)
+  // on each tensor axis. The template indirect fast path is safe for such a
+  // mask only when every slice starts at constant zero and its constant extent
+  // covers the complete physical tensor axis. Dynamic, shifted, prefix, and
+  // other partial slices may leave physical lanes inactive and must use the
+  // scalar-loop fallback. A missing or rank-incompatible MaskState is outside
+  // this check and preserves the existing fast-path eligibility.
+  // A dynamic extent is conservatively treated as partial even if a particular
+  // runtime value happens to cover the full axis.
+  if (!maskState || maskState->getRank() != tensorShape.size())
+    return false;
+
+  for (auto [offset, dim, size] :
+       llvm::zip_equal(maskState->offsets, maskState->dims, tensorShape)) {
+    auto constantOffset = getConstantIntValue(offset);
+    auto constantDim = getConstantIntValue(dim);
+    if (!constantOffset || *constantOffset != 0 || !constantDim ||
+        *constantDim != size)
+      return true;
+  }
+
+  return false;
+}
+
 template <typename MemAccOpTy>
 LogicalResult tryRewriteIndirectFastPath(MemAccOpTy op, Location loc,
                                          Value srcPtr, Value ptrOffset,
@@ -523,6 +549,49 @@ bool UnstructuredMemAccessConverter<triton::StoreOp>::checkUnstructureAnnotated(
     }
     return false;
   });
+}
+
+// A null result denotes a predicate already enforced by the generated loops.
+// Keep this limited to conjunctions and broadcast upper bounds. In particular,
+// do not remove scalar gates or predicates with nonzero/unknown loop starts.
+static Value getResidualLoadMask(Value mask, ArrayRef<bool> boundedLoopAxes,
+                                 PatternRewriter &rewriter) {
+  if (auto andOp = mask.getDefiningOp<arith::AndIOp>()) {
+    Value lhs = getResidualLoadMask(andOp.getLhs(), boundedLoopAxes, rewriter);
+    Value rhs = getResidualLoadMask(andOp.getRhs(), boundedLoopAxes, rewriter);
+    if (!lhs)
+      return rhs;
+    if (!rhs)
+      return lhs;
+    if (lhs == andOp.getLhs() && rhs == andOp.getRhs())
+      return mask;
+    return rewriter.create<arith::AndIOp>(andOp.getLoc(), lhs, rhs);
+  }
+
+  auto broadcast = mask.getDefiningOp<triton::BroadcastOp>();
+  if (!broadcast)
+    return mask;
+  auto sourceType = cast<RankedTensorType>(broadcast.getSrc().getType());
+  if (sourceType.getShape().size() != boundedLoopAxes.size())
+    return mask;
+  bool hasLoopAxis = false;
+  for (auto [axis, size] : llvm::enumerate(sourceType.getShape())) {
+    if (size == 1)
+      continue;
+    if (!boundedLoopAxes[axis])
+      return mask;
+    hasLoopAxis = true;
+  }
+  if (!hasLoopAxis)
+    return mask;
+
+  Value predicate = broadcast.getSrc();
+  while (auto expand = predicate.getDefiningOp<triton::ExpandDimsOp>())
+    predicate = expand.getSrc();
+  auto cmp = predicate.getDefiningOp<arith::CmpIOp>();
+  if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::slt)
+    return mask;
+  return {};
 }
 
 template <typename MemAccOpTy>
@@ -892,6 +961,11 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
       triton::ascend::isSimtTemplateMode(unstructureCompileMode) &&
       ((!ptrOffsetInfo.isStructured() && sizeInByte < 64) ||
        mixCompileDiscreteMask);
+  if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp> ||
+                std::is_same_v<MemAccOpTy, triton::StoreOp>) {
+    templateIndirectFastPathEnabled &=
+        !isMaskOutTensorLanes(mstate, resultShape);
+  }
   bool rankWithinIndirectLoadStoreFastPathLimit = resultShape.size() <= 5;
   if (templateIndirectFastPathEnabled &&
       succeeded(tryRewriteIndirectFastPath(op, loc, srcPtr, ptrOffset,
@@ -933,6 +1007,7 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
   SmallVector<OpFoldResult> sizes;
   SmallVector<OpFoldResult> strides;
   SmallVector<int64_t> extractedShape;
+  SmallVector<bool> boundedLoopAxes(resultShape.size(), false);
 
   for (size_t i = 0; i < resultShape.size(); i++) {
     auto size = resultShape[i];
@@ -972,6 +1047,12 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
         maskDim = rewriter.create<arith::AddIOp>(loc, maskOffset, maskDim);
         maskDim = rewriter.create<arith::MinSIOp>(loc, maskDim, sizeVal);
         loopUpper = maskDim;
+        // With a zero mask offset, [0, loopUpper) is contained in the
+        // analyzed interval. Do not infer this for a clipped negative start:
+        // clamping the start can otherwise shift a nonempty interval.
+        boundedLoopAxes[i] = mstate->isMask() &&
+                             mstate->dims.size() == resultShape.size() &&
+                             isConstantIntValue(mstate->offsets[i], 0);
       }
 
       if (isLoadLike) {
@@ -1066,8 +1147,11 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
     if (mstate && !fullyUnstructured) {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(accessedOp);
-      accessedOp.getMaskMutable().assign(createExtractOp(
-          loc, op.getMask(), rewriter, offsets, sizes, strides));
+      Value residualMask =
+          getResidualLoadMask(op.getMask(), boundedLoopAxes, rewriter);
+      if (residualMask)
+        accessedOp.getMaskMutable().assign(createExtractOp(
+            loc, residualMask, rewriter, offsets, sizes, strides));
     }
   }
 

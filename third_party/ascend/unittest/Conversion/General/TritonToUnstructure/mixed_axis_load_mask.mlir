@@ -2,21 +2,30 @@
 // RUN: triton-opt %s --triton-to-unstructure --bubble-up-operation --triton-to-linalg --verify-each | FileCheck %s --check-prefix=LOWER
 // RUN: triton-opt %s --triton-to-unstructure='compile-on-910-95=true compile-mode=simd_simt_template' --bubble-up-operation --triton-to-linalg='compile-on-910-95=true compile-mode=simd_simt_template' --verify-each | FileCheck %s --check-prefix=LOWER
 // RUN: sed 's/%mask, %other/%mask/' %s | triton-opt --triton-to-unstructure --bubble-up-operation --triton-to-linalg --verify-each | FileCheck %s --check-prefix=LOWER
+// RUN: sed 's/cmpi slt, %x/cmpi eq, %x/' %s | triton-opt --triton-to-unstructure --verify-each | FileCheck %s --check-prefix=KEEP
+// RUN: sed 's/cmpi slt, %x/cmpi sge, %x/' %s | triton-opt --triton-to-unstructure --verify-each | FileCheck %s --check-prefix=KEEP
 
 // The row addresses are nonstructured, but columns have a fixed stride. Both
 // mask bounds must guard memory access, even when the result is selected later.
 // Runtime lower/upper bounds also cover nonzero starts and empty intersections.
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   // T2U-LABEL: tt.func public @mixed_axis_load_mask(
+  // T2U: %[[COLMASK:.*]] = tt.broadcast %{{.*}} : tensor<1x32xi1> -> tensor<3x32xi1>
+  // T2U: %[[FULLMASK:.*]] = arith.andi
   // T2U: scf.for
-  // T2U: %[[MASK:.*]] = tensor.extract_slice %{{.*}}[%{{.*}}, 0] [1, 32] [1, 1] {DiscreteMemAccess} : tensor<3x32xi1> to tensor<1x32xi1>
+  // T2U: %[[MASK:.*]] = tensor.extract_slice %[[COLMASK]][%{{.*}}, 0] [1, 32] [1, 1] {DiscreteMemAccess} : tensor<3x32xi1> to tensor<1x32xi1>
   // T2U: tt.load %{{[^,]+}}, %[[MASK]] {DiscreteMemAccess} : tensor<1x32x!tt.ptr<f32>>
-  // T2U: arith.select
+  // T2U: arith.select %[[FULLMASK]],
+  // KEEP-LABEL: tt.func public @mixed_axis_load_mask(
+  // KEEP: %[[FULLMASK:.*]] = arith.andi %{{.*}}, %{{.*}} : tensor<3x32xi1>
+  // KEEP: scf.for
+  // KEEP: %[[MASK:.*]] = tensor.extract_slice %[[FULLMASK]][%{{.*}}, 0] [1, 32] [1, 1] {DiscreteMemAccess} : tensor<3x32xi1> to tensor<1x32xi1>
+  // KEEP: tt.load %{{[^,]+}}, %[[MASK]] {DiscreteMemAccess} : tensor<1x32x!tt.ptr<f32>>
   // LOWER-LABEL: func.func @mixed_axis_load_mask(
   // LOWER: scf.for
   // LOWER: %[[BASE:.*]] = memref.reinterpret_cast
   // LOWER: %[[SOURCE:.*]] = memref.subview %[[BASE]]
-  // LOWER: memref.copy %[[SOURCE]], %{{.*}} : memref<?x?xf32,
+  // LOWER: memref.copy %[[SOURCE]], %{{.*}} : memref<1x?xf32,
   // LOWER: return
   tt.func public @mixed_axis_load_mask(%input: !tt.ptr<f32>, %output: !tt.ptr<f32>, %rows: i32, %lower: i32, %upper: i32) {
     %x = tt.make_range {start = 0 : i32, end = 3 : i32} : tensor<3xi32>
